@@ -10,6 +10,15 @@ const IP_PROTO_TCP = 6;
 const IP_PROTO_UDP = 17;
 const IP_PROTO_ICMP = 1;
 
+function makeTcpNatKey(
+  srcIP: string,
+  srcPort: number,
+  dstIP: string,
+  dstPort: number,
+): string {
+  return `TCP:${srcIP}:${srcPort}:${dstIP}:${dstPort}`;
+}
+
 const HTTP_METHODS = [
   "GET",
   "POST",
@@ -225,6 +234,7 @@ export class NetworkStack extends EventEmitter {
   private readonly TX_BUFFER_HIGH_WATER = 512 * 1024;
   private readonly TX_BUFFER_LOW_WATER = 128 * 1024;
   private readonly TCP_MAX_IN_FLIGHT_BYTES = 48 * 1024;
+  private readonly TCP_MAX_BURST_BYTES = 16 * 1024;
   private readonly txQueuePaused = new Set<string>();
   private readonly txFlowPaused = new Set<string>();
 
@@ -349,19 +359,21 @@ export class NetworkStack extends EventEmitter {
       // Instead, we fail fast to prevent deadlocks.
       const version = payload[0] >> 4;
       const ipProto = payload.length >= 10 ? payload[9] : -1;
-      if (version === 4 && ipProto === IP_PROTO_TCP && payload.length >= 40) {
+      const headerLen = (payload[0] & 0x0f) * 4;
+      if (
+        version === 4 &&
+        ipProto === IP_PROTO_TCP &&
+        payload.length >= headerLen + 4
+      ) {
         // Outbound host->guest packets invert the guest flow direction; rebuild the
         // nat key in the same guest->upstream order used by handleTCP.
         const guestIP = payload.subarray(16, 20).join(".");
-        const guestPort = payload.readUInt16BE(22);
+        const guestPort = payload.readUInt16BE(headerLen + 2);
         const upstreamIP = payload.subarray(12, 16).join(".");
-        const upstreamPort = payload.readUInt16BE(20);
-        const key = `TCP:${guestIP}:${guestPort}:${upstreamIP}:${upstreamPort}`;
-        const session = this.natTable.get(key);
-        if (session) {
-          this.callbacks.onTcpClose({ key, destroy: true });
-          this.clearPauseState(key);
-          this.natTable.delete(key);
+        const upstreamPort = payload.readUInt16BE(headerLen);
+        const key = makeTcpNatKey(guestIP, guestPort, upstreamIP, upstreamPort);
+        if (this.natTable.has(key)) {
+          this.destroyTcpSession(key);
         }
       }
     }
@@ -737,7 +749,7 @@ export class NetworkStack extends EventEmitter {
     const FIN = (flags & 0x01) !== 0;
     const RST = (flags & 0x04) !== 0;
 
-    const key = `TCP:${srcIP.join(".")}:${srcPort}:${dstIP.join(".")}:${dstPort}`;
+    const key = makeTcpNatKey(srcIP.join("."), srcPort, dstIP.join("."), dstPort);
     let session = this.natTable.get(key);
 
     if (RST) {
@@ -1257,6 +1269,12 @@ export class NetworkStack extends EventEmitter {
     this.txFlowPaused.delete(key);
   }
 
+  private destroyTcpSession(key: string) {
+    this.callbacks.onTcpClose({ key, destroy: true });
+    this.clearPauseState(key);
+    this.natTable.delete(key);
+  }
+
   private pauseFlow(key: string) {
     if (this.txFlowPaused.has(key)) {
       return;
@@ -1298,9 +1316,6 @@ export class NetworkStack extends EventEmitter {
     }
 
     const MSS = 1460;
-    // Cap the maximum bytes we burst into the virtio queue in a single event loop tick
-    // to prevent dropping packets due to intermediate buffer exhaustion in QEMU/Guest.
-    const MAX_BURST_BYTES = 16 * 1024;
     let bytesBurstThisTick = 0;
 
     let inFlight = Math.max(0, session.mySeq - session.vmAck);
@@ -1312,10 +1327,10 @@ export class NetworkStack extends EventEmitter {
     while (
       session.pendingOutbound.length > 0 &&
       inFlight < maxInFlight &&
-      bytesBurstThisTick < MAX_BURST_BYTES
+      bytesBurstThisTick < this.TCP_MAX_BURST_BYTES
     ) {
       const allowance = maxInFlight - inFlight;
-      const burstAllowance = MAX_BURST_BYTES - bytesBurstThisTick;
+      const burstAllowance = this.TCP_MAX_BURST_BYTES - bytesBurstThisTick;
       const chunkSize = Math.min(
         MSS,
         session.pendingOutbound.length,
@@ -1348,7 +1363,7 @@ export class NetworkStack extends EventEmitter {
     if (
       session.pendingOutbound.length > 0 &&
       inFlight < maxInFlight &&
-      bytesBurstThisTick >= MAX_BURST_BYTES
+      bytesBurstThisTick >= this.TCP_MAX_BURST_BYTES
     ) {
       setImmediate(() => {
         if (this.natTable.get(key) === session) {
