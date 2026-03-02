@@ -117,7 +117,13 @@ export type HttpSession = {
   sentContinue?: boolean;
 };
 
-function resetTaintState(httpSession: HttpSession) {
+function resetTaintState(
+  backend: QemuNetworkBackend,
+  httpSession: HttpSession,
+) {
+  if (httpSession.upstreamTainted && httpSession.upstreamOriginKey) {
+    evictSharedDispatcher(backend, httpSession.upstreamOriginKey);
+  }
   httpSession.upstreamTainted = false;
   httpSession.upstreamOriginKey = null;
 }
@@ -735,7 +741,7 @@ export async function handleHttpDataWithWriter(
         });
       } finally {
         releaseHttpConcurrency?.();
-        resetTaintState(httpSession);
+        resetTaintState(backend, httpSession);
         httpSession.processing = false;
         httpSession.closed = true;
         options.finish();
@@ -923,7 +929,7 @@ export async function handleHttpDataWithWriter(
         } finally {
           releaseHttpConcurrency?.();
           cleanupStreamingBodyState(backend, httpSession);
-          resetTaintState(httpSession);
+          resetTaintState(backend, httpSession);
           httpSession.processing = false;
           if (!httpSession.closed) {
             httpSession.closed = true;
@@ -1026,7 +1032,7 @@ export async function handleHttpDataWithWriter(
       }
     } finally {
       releaseHttpConcurrency?.();
-      resetTaintState(httpSession);
+      resetTaintState(backend, httpSession);
       httpSession.processing = false;
       if (!httpSession.closed) {
         httpSession.closed = true;
@@ -1053,7 +1059,7 @@ export async function handleHttpDataWithWriter(
 
     // Abort any active upstream body stream.
     cleanupStreamingBodyState(backend, httpSession, error);
-    resetTaintState(httpSession);
+    resetTaintState(backend, httpSession);
 
     httpSession.closed = true;
     options.finish();
@@ -1244,13 +1250,6 @@ export async function fetchHookRequestAndRespond(
   const fetcher = backend.options.fetch ?? undiciFetch;
 
   let pendingRequest: InternalHttpRequest = initialRequest;
-
-  const maybeEvictTaintedDispatcher = () => {
-    if (!httpSession.upstreamTainted) return;
-    const key = httpSession.upstreamOriginKey;
-    if (!key) return;
-    evictSharedDispatcher(backend, key);
-  };
 
   for (
     let redirectCount = 0;
@@ -1500,7 +1499,6 @@ export async function fetchHookRequestAndRespond(
         normalizeHookResponseForGuest(hookResponse, currentRequest.method),
         httpVersion,
       );
-      maybeEvictTaintedDispatcher();
       return;
     }
 
@@ -1585,7 +1583,6 @@ export async function fetchHookRequestAndRespond(
         );
       }
 
-      maybeEvictTaintedDispatcher();
       return;
     }
 
@@ -1648,7 +1645,6 @@ export async function fetchHookRequestAndRespond(
         `http bridge body complete ${requestLabel} ${hookResponse.body.length} bytes in ${elapsed}ms`,
       );
     }
-    maybeEvictTaintedDispatcher();
     return;
   }
 }

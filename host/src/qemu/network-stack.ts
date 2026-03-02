@@ -354,28 +354,7 @@ export class NetworkStack extends EventEmitter {
       this.classifyTxPriority(proto, payload),
     );
     if (!queued && proto === ETH_P_IP) {
-      // If a high-priority packet like IP/TCP gets dropped due to buffer limits,
-      // we cannot recover without complex retransmission logic.
-      // Instead, we fail fast to prevent deadlocks.
-      const version = payload[0] >> 4;
-      const ipProto = payload.length >= 10 ? payload[9] : -1;
-      const headerLen = (payload[0] & 0x0f) * 4;
-      if (
-        version === 4 &&
-        ipProto === IP_PROTO_TCP &&
-        payload.length >= headerLen + 4
-      ) {
-        // Outbound host->guest packets invert the guest flow direction; rebuild the
-        // nat key in the same guest->upstream order used by handleTCP.
-        const guestIP = payload.subarray(16, 20).join(".");
-        const guestPort = payload.readUInt16BE(headerLen + 2);
-        const upstreamIP = payload.subarray(12, 16).join(".");
-        const upstreamPort = payload.readUInt16BE(headerLen);
-        const key = makeTcpNatKey(guestIP, guestPort, upstreamIP, upstreamPort);
-        if (this.natTable.has(key)) {
-          this.destroyTcpSession(key);
-        }
-      }
+      this.teardownDroppedTcpSession(payload);
     }
   }
 
@@ -729,9 +708,7 @@ export class NetworkStack extends EventEmitter {
       ack,
       0x14,
     );
-    this.callbacks.onTcpClose({ key, destroy: true });
-    this.clearPauseState(key);
-    this.natTable.delete(key);
+    this.destroyTcpSession(key);
     this.emit("tcp-deny", { key, reason });
   }
 
@@ -754,9 +731,7 @@ export class NetworkStack extends EventEmitter {
 
     if (RST) {
       if (session) {
-        this.callbacks.onTcpClose({ key, destroy: true });
-        this.clearPauseState(key);
-        this.natTable.delete(key);
+        this.destroyTcpSession(key);
       }
       return;
     }
@@ -1273,6 +1248,34 @@ export class NetworkStack extends EventEmitter {
     this.callbacks.onTcpClose({ key, destroy: true });
     this.clearPauseState(key);
     this.natTable.delete(key);
+  }
+
+  /**
+   * When a TX-queued TCP packet is dropped, tear down the NAT session to
+   * prevent deadlocks (we cannot retransmit from the userspace stack).
+   */
+  private teardownDroppedTcpSession(ipPayload: Buffer) {
+    if (ipPayload.length < 20) return;
+    const version = ipPayload[0] >> 4;
+    const ipProto = ipPayload[9];
+    const headerLen = (ipPayload[0] & 0x0f) * 4;
+    if (
+      version !== 4 ||
+      ipProto !== IP_PROTO_TCP ||
+      ipPayload.length < headerLen + 4
+    ) {
+      return;
+    }
+    // Outbound host→guest packets invert the guest flow direction; rebuild the
+    // NAT key in the same guest→upstream order used by handleTCP.
+    const guestIP = ipPayload.subarray(16, 20).join(".");
+    const guestPort = ipPayload.readUInt16BE(headerLen + 2);
+    const upstreamIP = ipPayload.subarray(12, 16).join(".");
+    const upstreamPort = ipPayload.readUInt16BE(headerLen);
+    const key = makeTcpNatKey(guestIP, guestPort, upstreamIP, upstreamPort);
+    if (this.natTable.has(key)) {
+      this.destroyTcpSession(key);
+    }
   }
 
   private pauseFlow(key: string) {
