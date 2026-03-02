@@ -43,6 +43,7 @@ Use `/** … */` above TS properties and `/// …` above Zig fields. Keep commen
 
 - Tests are in `host/test/*.test.ts` with shared helpers in `host/test/helpers/`.
 - VM integration tests require hardware acceleration (macOS HVF or Linux KVM). Use `shouldSkipVmTests()` from `host/test/helpers/vm-fixture.ts` to gate them.
+- VM tests that construct `VM` directly should also gate on `hasGuestAssets()` from `host/src/assets.ts` to skip cleanly when guest assets are not built locally.
 - Unit tests that don't need a VM should not import VM fixtures. Keep them fast and isolated.
 - The test timeout in CI is 120s for VM tests. If adding slow tests, be mindful of this limit.
 

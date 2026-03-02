@@ -604,6 +604,8 @@ export class QemuNetworkBackend extends EventEmitter {
               buffer: new HttpReceiveBuffer(),
               processing: false,
               closed: false,
+              upstreamTainted: false,
+              upstreamOriginKey: null,
               sentContinue: false,
             };
           }
@@ -981,6 +983,7 @@ export class QemuNetworkBackend extends EventEmitter {
     const session = this.tcpSessions.get(message.key);
     if (session) {
       if (session.http?.streamingBody && !session.http.streamingBody.done) {
+        session.http.upstreamTainted = true;
         const controller = session.http.streamingBody.controller;
         try {
           controller?.error(new Error("guest closed"));

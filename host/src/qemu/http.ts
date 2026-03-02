@@ -29,6 +29,7 @@ import {
   coalesceHeaderRecord,
   parseContentLength,
   applyRedirectRequest,
+  evictSharedDispatcher,
   getCheckedDispatcher,
   getRedirectUrl,
   normalizeLookupEntries,
@@ -66,6 +67,10 @@ export type HttpSession = {
   buffer: HttpReceiveBuffer;
   processing: boolean;
   closed: boolean;
+  /** whether the current upstream dispatcher is tainted */
+  upstreamTainted: boolean;
+  /** origin key for the current upstream dispatcher */
+  upstreamOriginKey: string | null;
 
   /** cached request head state (we only process one HTTP request per TCP session) */
   head?: {
@@ -306,6 +311,8 @@ export async function handleHttpDataWithWriter(
       buffer: new HttpReceiveBuffer(),
       processing: false,
       closed: false,
+      upstreamTainted: false,
+      upstreamOriginKey: null,
       sentContinue: false,
     } satisfies HttpSession);
   session.http = httpSession;
@@ -719,9 +726,12 @@ export async function handleHttpDataWithWriter(
           write: options.write,
           waitForWritable: options.waitForWritable,
           policyCheckedFirstHop: state.policyPrechecked,
+          httpSession,
         });
       } finally {
         releaseHttpConcurrency?.();
+        httpSession.upstreamTainted = false;
+        httpSession.upstreamOriginKey = null;
         httpSession.processing = false;
         httpSession.closed = true;
         options.finish();
@@ -885,6 +895,7 @@ export async function handleHttpDataWithWriter(
             policyCheckedFirstHop: state.policyPrechecked,
             initialBodyStream: bodyStream as any,
             initialBodyStreamHasBody: true,
+            httpSession,
           });
         } catch (err) {
           const error = err instanceof Error ? err : new Error(String(err));
@@ -908,6 +919,8 @@ export async function handleHttpDataWithWriter(
         } finally {
           releaseHttpConcurrency?.();
           cleanupStreamingBodyState(backend, httpSession);
+          httpSession.upstreamTainted = false;
+          httpSession.upstreamOriginKey = null;
           httpSession.processing = false;
           if (!httpSession.closed) {
             httpSession.closed = true;
@@ -989,6 +1002,7 @@ export async function handleHttpDataWithWriter(
         write: options.write,
         waitForWritable: options.waitForWritable,
         policyCheckedFirstHop: state.policyPrechecked,
+        httpSession,
       });
     } catch (err) {
       const error = err instanceof Error ? err : new Error(String(err));
@@ -1009,6 +1023,8 @@ export async function handleHttpDataWithWriter(
       }
     } finally {
       releaseHttpConcurrency?.();
+      httpSession.upstreamTainted = false;
+      httpSession.upstreamOriginKey = null;
       httpSession.processing = false;
       if (!httpSession.closed) {
         httpSession.closed = true;
@@ -1035,6 +1051,8 @@ export async function handleHttpDataWithWriter(
 
     // Abort any active upstream body stream.
     cleanupStreamingBodyState(backend, httpSession, error);
+    httpSession.upstreamTainted = false;
+    httpSession.upstreamOriginKey = null;
 
     httpSession.closed = true;
     options.finish();
@@ -1207,6 +1225,8 @@ export async function fetchHookRequestAndRespond(
 
     /** whether the initial body stream carries a request body */
     initialBodyStreamHasBody?: boolean;
+    /** optional session state for dispatcher taint tracking */
+    httpSession?: HttpSession;
   },
 ) {
   const {
@@ -1217,11 +1237,19 @@ export async function fetchHookRequestAndRespond(
     policyCheckedFirstHop = false,
     initialBodyStream = null,
     initialBodyStreamHasBody = Boolean(initialBodyStream),
+    httpSession,
   } = options;
 
   const fetcher = backend.options.fetch ?? undiciFetch;
 
   let pendingRequest: InternalHttpRequest = initialRequest;
+
+  const maybeEvictTaintedDispatcher = (originKey: string | null) => {
+    if (!httpSession?.upstreamTainted) return;
+    const key = httpSession.upstreamOriginKey ?? originKey;
+    if (!key) return;
+    evictSharedDispatcher(backend, key);
+  };
 
   for (
     let redirectCount = 0;
@@ -1292,6 +1320,12 @@ export async function fetchHookRequestAndRespond(
     }
 
     const useDefaultFetch = backend.options.fetch === undefined;
+    const originKey = useDefaultFetch
+      ? `${protocol}://${currentUrl.hostname}:${port}`
+      : null;
+    if (httpSession) {
+      httpSession.upstreamOriginKey = originKey;
+    }
     const dispatcher = useDefaultFetch
       ? getCheckedDispatcher(backend, {
           hostname: currentUrl.hostname,
@@ -1317,9 +1351,8 @@ export async function fetchHookRequestAndRespond(
         ...(dispatcher ? { dispatcher } : {}),
       } as any);
     } catch (err) {
-      if (useDefaultFetch) {
-        const originKey = `${protocol}://${currentUrl.hostname}:${port}`;
-        backend.http.sharedDispatchers.delete(originKey);
+      if (originKey) {
+        evictSharedDispatcher(backend, originKey);
       }
       if (backend.options.debug) {
         const message = err instanceof Error ? err.message : String(err);
@@ -1468,6 +1501,7 @@ export async function fetchHookRequestAndRespond(
         normalizeHookResponseForGuest(hookResponse, currentRequest.method),
         httpVersion,
       );
+      maybeEvictTaintedDispatcher(originKey);
       return;
     }
 
@@ -1534,11 +1568,14 @@ export async function fetchHookRequestAndRespond(
           );
         }
       } catch (err) {
-        if (useDefaultFetch) {
-          const originKey = `${protocol}://${currentUrl.hostname}:${port}`;
-          backend.http.sharedDispatchers.delete(originKey);
+        if (originKey) {
+          evictSharedDispatcher(backend, originKey);
         }
-        try { await responseBodyStream.cancel(); } catch {}
+        try {
+          await responseBodyStream.cancel();
+        } catch {
+          // ignore cancellation failures
+        }
         throw err;
       }
 
@@ -1549,6 +1586,7 @@ export async function fetchHookRequestAndRespond(
         );
       }
 
+      maybeEvictTaintedDispatcher(originKey);
       return;
     }
 
@@ -1611,6 +1649,7 @@ export async function fetchHookRequestAndRespond(
         `http bridge body complete ${requestLabel} ${hookResponse.body.length} bytes in ${elapsed}ms`,
       );
     }
+    maybeEvictTaintedDispatcher(originKey);
     return;
   }
 }

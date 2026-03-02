@@ -1280,7 +1280,7 @@ test("network-stack: TCP flow control pauses when tx buffer grows and resumes wh
   assert.equal(resumes.length, 0);
 
   // Drive ACK progress until queued outbound bytes are flushed.
-  for (let i = 0; i < 32; i++) {
+  for (let i = 0; i < 64; i++) {
     const session = (stack as any).natTable.get(key);
     if (!session) break;
     if (session.pendingOutbound.length === 0) break;

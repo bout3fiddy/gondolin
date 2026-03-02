@@ -339,24 +339,31 @@ export class NetworkStack extends EventEmitter {
     packet.writeUInt32BE(frame.length, 0);
     frame.copy(packet, 4);
 
-    const queued = this.enqueueTx(packet, this.classifyTxPriority(proto, payload));
+    const queued = this.enqueueTx(
+      packet,
+      this.classifyTxPriority(proto, payload),
+    );
     if (!queued && proto === ETH_P_IP) {
-        // If a high-priority packet like IP/TCP gets dropped due to buffer limits,
-        // we cannot recover without complex retransmission logic.
-        // Instead, we fail fast to prevent deadlocks.
-        const version = payload[0] >> 4;
-        const ipProto = payload.length >= 10 ? payload[9] : -1;
-        if (version === 4 && ipProto === IP_PROTO_TCP && payload.length >= 40) {
-            const srcPort = payload.readUInt16BE(20);
-            const dstPort = payload.readUInt16BE(22);
-            const key = `TCP:${this.vmIP}:${dstPort}:${this.gatewayIP}:${srcPort}`;
-            const session = this.natTable.get(key);
-            if (session) {
-                this.callbacks.onTcpClose({ key, destroy: true });
-                this.clearPauseState(key);
-                this.natTable.delete(key);
-            }
+      // If a high-priority packet like IP/TCP gets dropped due to buffer limits,
+      // we cannot recover without complex retransmission logic.
+      // Instead, we fail fast to prevent deadlocks.
+      const version = payload[0] >> 4;
+      const ipProto = payload.length >= 10 ? payload[9] : -1;
+      if (version === 4 && ipProto === IP_PROTO_TCP && payload.length >= 40) {
+        // Outbound host->guest packets invert the guest flow direction; rebuild the
+        // nat key in the same guest->upstream order used by handleTCP.
+        const guestIP = payload.subarray(16, 20).join(".");
+        const guestPort = payload.readUInt16BE(22);
+        const upstreamIP = payload.subarray(12, 16).join(".");
+        const upstreamPort = payload.readUInt16BE(20);
+        const key = `TCP:${guestIP}:${guestPort}:${upstreamIP}:${upstreamPort}`;
+        const session = this.natTable.get(key);
+        if (session) {
+          this.callbacks.onTcpClose({ key, destroy: true });
+          this.clearPauseState(key);
+          this.natTable.delete(key);
         }
+      }
     }
   }
 
@@ -1302,14 +1309,18 @@ export class NetworkStack extends EventEmitter {
       Math.min(session.peerWindow, this.TCP_MAX_IN_FLIGHT_BYTES),
     );
 
-    while (session.pendingOutbound.length > 0 && inFlight < maxInFlight && bytesBurstThisTick < MAX_BURST_BYTES) {
+    while (
+      session.pendingOutbound.length > 0 &&
+      inFlight < maxInFlight &&
+      bytesBurstThisTick < MAX_BURST_BYTES
+    ) {
       const allowance = maxInFlight - inFlight;
       const burstAllowance = MAX_BURST_BYTES - bytesBurstThisTick;
       const chunkSize = Math.min(
         MSS,
         session.pendingOutbound.length,
         allowance,
-        burstAllowance
+        burstAllowance,
       );
       if (chunkSize <= 0) {
         break;
@@ -1334,13 +1345,17 @@ export class NetworkStack extends EventEmitter {
     }
 
     // If we stopped early due to burst limits, queue another drain on the next tick
-    if (session.pendingOutbound.length > 0 && inFlight < maxInFlight && bytesBurstThisTick >= MAX_BURST_BYTES) {
-        setImmediate(() => {
-            if (this.natTable.has(key)) {
-                this.drainOutboundTcp(key, session);
-            }
-        });
-        return; // Don't process endPending until the outbound buffer is fully drained
+    if (
+      session.pendingOutbound.length > 0 &&
+      inFlight < maxInFlight &&
+      bytesBurstThisTick >= MAX_BURST_BYTES
+    ) {
+      setImmediate(() => {
+        if (this.natTable.get(key) === session) {
+          this.drainOutboundTcp(key, session);
+        }
+      });
+      return; // Don't process endPending until the outbound buffer is fully drained
     }
 
     if (session.pendingOutbound.length === 0 && session.endPending) {
