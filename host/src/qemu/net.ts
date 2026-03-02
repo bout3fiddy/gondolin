@@ -338,7 +338,10 @@ export class QemuNetworkBackend extends EventEmitter {
 
   private readonly tlsContextCacheMaxEntries: number;
   private readonly tlsContextCacheTtlMs: number;
-  private readonly flowResumeWaiters = new Map<string, Array<() => void>>();
+  private readonly flowResumeWaiters = new Map<
+    string,
+    Array<{ resolve: () => void; reject: (err: Error) => void }>
+  >();
 
   private readonly dnsMode: DnsMode;
   private readonly trustedDnsServers: string[];
@@ -994,7 +997,7 @@ export class QemuNetworkBackend extends EventEmitter {
       session.pendingWrites = [];
       session.pendingWriteBytes = 0;
       session.flowControlPaused = false;
-      this.resolveFlowResume(message.key);
+      this.resolveFlowResume(message.key, new Error("guest closed"));
       if (session.tls) {
         if (message.destroy) {
           session.tls.socket.destroy();
@@ -1039,23 +1042,33 @@ export class QemuNetworkBackend extends EventEmitter {
   /** @internal */
   waitForFlowResume(key: string): Promise<void> {
     const session = this.tcpSessions.get(key);
-    if (!session || !session.flowControlPaused) {
+    if (!session) {
+      return Promise.reject(new Error("guest closed"));
+    }
+    if (!session.flowControlPaused) {
       return Promise.resolve();
     }
-    return new Promise((resolve) => {
+    return new Promise((resolve, reject) => {
       const waiters = this.flowResumeWaiters.get(key) ?? [];
-      waiters.push(resolve);
+      waiters.push({ resolve, reject });
       this.flowResumeWaiters.set(key, waiters);
     });
   }
 
   /** @internal */
-  resolveFlowResume(key: string) {
+  resolveFlowResume(key: string, err?: Error) {
     const waiters = this.flowResumeWaiters.get(key);
     if (!waiters) return;
     this.flowResumeWaiters.delete(key);
-    for (const resolve of waiters) {
-      resolve();
+    const session = this.tcpSessions.get(key);
+    for (const waiter of waiters) {
+      if (err) {
+        waiter.reject(err);
+      } else if (!session) {
+        waiter.reject(new Error("guest closed"));
+      } else {
+        waiter.resolve();
+      }
     }
   }
 

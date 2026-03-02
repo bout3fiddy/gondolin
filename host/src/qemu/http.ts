@@ -1317,6 +1317,10 @@ export async function fetchHookRequestAndRespond(
         ...(dispatcher ? { dispatcher } : {}),
       } as any);
     } catch (err) {
+      if (useDefaultFetch) {
+        const originKey = `${protocol}://${currentUrl.hostname}:${port}`;
+        backend.http.sharedDispatchers.delete(originKey);
+      }
       if (backend.options.debug) {
         const message = err instanceof Error ? err.message : String(err);
         backend.emitDebug(
@@ -1474,26 +1478,45 @@ export async function fetchHookRequestAndRespond(
       const allowChunked = httpVersion === "HTTP/1.1";
       let streamedBytes = 0;
 
-      if (contentEncoding || !hasValidLength) {
-        delete responseHeaders["content-length"];
+      try {
+        if (contentEncoding || !hasValidLength) {
+          delete responseHeaders["content-length"];
 
-        if (allowChunked) {
-          responseHeaders["transfer-encoding"] = "chunked";
-          sendHttpResponseHead(
-            write,
-            {
-              status: response.status,
-              statusText: response.statusText || "OK",
-              headers: responseHeaders,
-            },
-            httpVersion,
-          );
-          streamedBytes = await sendChunkedBody(
-            responseBodyStream,
-            write,
-            waitForWritable,
-          );
+          if (allowChunked) {
+            responseHeaders["transfer-encoding"] = "chunked";
+            sendHttpResponseHead(
+              write,
+              {
+                status: response.status,
+                statusText: response.statusText || "OK",
+                headers: responseHeaders,
+              },
+              httpVersion,
+            );
+            streamedBytes = await sendChunkedBody(
+              responseBodyStream,
+              write,
+              waitForWritable,
+            );
+          } else {
+            delete responseHeaders["transfer-encoding"];
+            sendHttpResponseHead(
+              write,
+              {
+                status: response.status,
+                statusText: response.statusText || "OK",
+                headers: responseHeaders,
+              },
+              httpVersion,
+            );
+            streamedBytes = await sendStreamBody(
+              responseBodyStream,
+              write,
+              waitForWritable,
+            );
+          }
         } else {
+          responseHeaders["content-length"] = parsedLength!.toString();
           delete responseHeaders["transfer-encoding"];
           sendHttpResponseHead(
             write,
@@ -1510,23 +1533,13 @@ export async function fetchHookRequestAndRespond(
             waitForWritable,
           );
         }
-      } else {
-        responseHeaders["content-length"] = parsedLength!.toString();
-        delete responseHeaders["transfer-encoding"];
-        sendHttpResponseHead(
-          write,
-          {
-            status: response.status,
-            statusText: response.statusText || "OK",
-            headers: responseHeaders,
-          },
-          httpVersion,
-        );
-        streamedBytes = await sendStreamBody(
-          responseBodyStream,
-          write,
-          waitForWritable,
-        );
+      } catch (err) {
+        if (useDefaultFetch) {
+          const originKey = `${protocol}://${currentUrl.hostname}:${port}`;
+          backend.http.sharedDispatchers.delete(originKey);
+        }
+        try { await responseBodyStream.cancel(); } catch {}
+        throw err;
       }
 
       if (backend.options.debug) {

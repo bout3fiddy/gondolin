@@ -339,7 +339,25 @@ export class NetworkStack extends EventEmitter {
     packet.writeUInt32BE(frame.length, 0);
     frame.copy(packet, 4);
 
-    this.enqueueTx(packet, this.classifyTxPriority(proto, payload));
+    const queued = this.enqueueTx(packet, this.classifyTxPriority(proto, payload));
+    if (!queued && proto === ETH_P_IP) {
+        // If a high-priority packet like IP/TCP gets dropped due to buffer limits,
+        // we cannot recover without complex retransmission logic.
+        // Instead, we fail fast to prevent deadlocks.
+        const version = payload[0] >> 4;
+        const ipProto = payload.length >= 10 ? payload[9] : -1;
+        if (version === 4 && ipProto === IP_PROTO_TCP && payload.length >= 40) {
+            const srcPort = payload.readUInt16BE(20);
+            const dstPort = payload.readUInt16BE(22);
+            const key = `TCP:${this.vmIP}:${dstPort}:${this.gatewayIP}:${srcPort}`;
+            const session = this.natTable.get(key);
+            if (session) {
+                this.callbacks.onTcpClose({ key, destroy: true });
+                this.clearPauseState(key);
+                this.natTable.delete(key);
+            }
+        }
+    }
   }
 
   sendBroadcast(payload: Buffer, proto: number) {
@@ -380,8 +398,8 @@ export class NetworkStack extends EventEmitter {
    * - `"network-activity"` when something is queued
    * - `"tx-drop"` with {@link TxDropInfo} when a packet is dropped/evicted due to queue limits
    */
-  private enqueueTx(packet: Buffer, priority: TxPriority) {
-    if (packet.length === 0) return;
+  private enqueueTx(packet: Buffer, priority: TxPriority): boolean {
+    if (packet.length === 0) return true;
 
     if (packet.length > this.TX_QUEUE_MAX_BYTES) {
       const info: TxDropInfo = {
@@ -390,7 +408,7 @@ export class NetworkStack extends EventEmitter {
         reason: "packet-too-large",
       };
       this.emit("tx-drop", info);
-      return;
+      return false;
     }
 
     // Enforce a hard cap to avoid unbounded memory growth if QEMU stops draining.
@@ -402,7 +420,7 @@ export class NetworkStack extends EventEmitter {
           reason: "queue-full",
         };
         this.emit("tx-drop", info);
-        return;
+        return false;
       }
 
       // For high-priority packets (TCP/ARP), evict low-priority packets first.
@@ -433,7 +451,7 @@ export class NetworkStack extends EventEmitter {
           evictedBytes,
         };
         this.emit("tx-drop", info);
-        return;
+        return false;
       }
     }
 
@@ -446,6 +464,7 @@ export class NetworkStack extends EventEmitter {
 
     this.txQueueSize += packet.length;
     this.emit("network-activity");
+    return true;
   }
 
   receive(frame: Buffer) {
@@ -1272,18 +1291,25 @@ export class NetworkStack extends EventEmitter {
     }
 
     const MSS = 1460;
+    // Cap the maximum bytes we burst into the virtio queue in a single event loop tick
+    // to prevent dropping packets due to intermediate buffer exhaustion in QEMU/Guest.
+    const MAX_BURST_BYTES = 16 * 1024;
+    let bytesBurstThisTick = 0;
+
     let inFlight = Math.max(0, session.mySeq - session.vmAck);
     const maxInFlight = Math.max(
       0,
       Math.min(session.peerWindow, this.TCP_MAX_IN_FLIGHT_BYTES),
     );
 
-    while (session.pendingOutbound.length > 0 && inFlight < maxInFlight) {
+    while (session.pendingOutbound.length > 0 && inFlight < maxInFlight && bytesBurstThisTick < MAX_BURST_BYTES) {
       const allowance = maxInFlight - inFlight;
+      const burstAllowance = MAX_BURST_BYTES - bytesBurstThisTick;
       const chunkSize = Math.min(
         MSS,
         session.pendingOutbound.length,
         allowance,
+        burstAllowance
       );
       if (chunkSize <= 0) {
         break;
@@ -1304,6 +1330,17 @@ export class NetworkStack extends EventEmitter {
       );
       session.mySeq += chunk.length;
       inFlight += chunk.length;
+      bytesBurstThisTick += chunk.length;
+    }
+
+    // If we stopped early due to burst limits, queue another drain on the next tick
+    if (session.pendingOutbound.length > 0 && inFlight < maxInFlight && bytesBurstThisTick >= MAX_BURST_BYTES) {
+        setImmediate(() => {
+            if (this.natTable.has(key)) {
+                this.drainOutboundTcp(key, session);
+            }
+        });
+        return; // Don't process endPending until the outbound buffer is fully drained
     }
 
     if (session.pendingOutbound.length === 0 && session.endPending) {
