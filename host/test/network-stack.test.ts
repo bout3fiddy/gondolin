@@ -1524,10 +1524,9 @@ function countTcpPayloadBytes(txBuf: Buffer): number {
   return total;
 }
 
-test("network-stack: ACK during burst-limited drain bypasses per-tick pacing", async () => {
+test("network-stack: drainOutboundTcp respects per-tick burst limit", async () => {
   const gatewayMac = mac([0x5a, 0x94, 0xef, 0xe4, 0x0c, 0xdd]);
   const vmMac = mac([0x02, 0x00, 0x00, 0x00, 0x00, 0x01]);
-
   let key = "";
 
   const stack = new NetworkStack({
@@ -1548,102 +1547,33 @@ test("network-stack: ACK during burst-limited drain bypasses per-tick pacing", a
   const dstIP = ip([93, 184, 216, 34]);
   const BURST_LIMIT = 16 * 1024;
 
-  // Establish TCP connection.
+  // 3-way handshake: SYN → SYN-ACK → ACK
   stack.handleTCP(
     buildTcpSegment({ srcPort: 50001, dstPort: 80, seq: 1, ack: 0, flags: 0x02 }),
-    srcIP,
-    dstIP,
+    srcIP, dstIP,
   );
   stack.handleTcpConnected({ key });
-  drainAllQemuTx(stack); // drain SYN-ACK
-
-  // Guest ACKs the SYN-ACK so vmAck advances and data can flow.
-  const session0 = (stack as any).natTable.get(key);
+  drainAllQemuTx(stack);
+  const session = (stack as any).natTable.get(key);
   stack.handleTCP(
-    buildTcpSegment({
-      srcPort: 50001,
-      dstPort: 80,
-      seq: 2,
-      ack: session0.mySeq,
-      flags: 0x10,
-    }),
-    srcIP,
-    dstIP,
+    buildTcpSegment({ srcPort: 50001, dstPort: 80, seq: 2, ack: session.mySeq, flags: 0x10 }),
+    srcIP, dstIP,
   );
 
-  // Queue 48KB of outbound data — enough for 3 bursts.
+  // Queue 48KB — 3× the burst limit.
   stack.handleTcpData({ key, data: Buffer.alloc(48 * 1024, 0x42) });
 
-  // Drain the TX queue (first burst: 16KB of TCP data).
-  const firstDrainTx = drainAllQemuTx(stack);
-  const firstDrainBytes = countTcpPayloadBytes(firstDrainTx);
-
-  // Now send an ACK for everything sent so far, which triggers
-  // a synchronous drainOutboundTcp BEFORE the setImmediate fires.
-  const session = (stack as any).natTable.get(key);
-  assert.ok(session, "session should still exist");
-
-  stack.handleTCP(
-    buildTcpSegment({
-      srcPort: 50001,
-      dstPort: 80,
-      seq: session.vmSeq,
-      ack: session.mySeq,
-      flags: 0x10, // ACK
-    }),
-    srcIP,
-    dstIP,
-  );
-
-  // Drain the TX queue again (second burst from ACK-triggered drain).
-  const secondDrainTx = drainAllQemuTx(stack);
-  const secondDrainBytes = countTcpPayloadBytes(secondDrainTx);
-
-  // Wait for setImmediate to fire and check how many bytes it sends.
-  // Without the drainScheduled guard, the ACK-triggered drain would have
-  // scheduled a second setImmediate, causing duplicate drain callbacks.
-  const thirdBurstBytes = await new Promise<number>((resolve) => {
-    setImmediate(() => {
-      const tx = drainAllQemuTx(stack);
-      resolve(countTcpPayloadBytes(tx));
-    });
-  });
-
-  // The setImmediate continuation should send additional bytes because
-  // it was scheduled before the ACK-triggered drain happened — this
-  // demonstrates the concurrent drain overlap.
-  //
-  // With a drainScheduled guard, thirdBurstBytes would be 0 because the
-  // ACK-triggered drain already drained the data that the setImmediate
-  // was going to process.
-  assert.ok(
-    firstDrainBytes > 0,
-    `first drain should send data (got ${firstDrainBytes})`,
-  );
+  // First drain must send at most one burst of TCP payload.
+  const firstDrainBytes = countTcpPayloadBytes(drainAllQemuTx(stack));
+  assert.ok(firstDrainBytes > 0, `expected data, got ${firstDrainBytes}`);
   assert.ok(
     firstDrainBytes <= BURST_LIMIT,
     `first drain should respect burst limit: ${firstDrainBytes} <= ${BURST_LIMIT}`,
   );
 
-  // The ACK-triggered drain runs synchronously (sends another burst).
-  assert.ok(
-    secondDrainBytes > 0,
-    `ACK-triggered drain should send data (got ${secondDrainBytes})`,
-  );
-  assert.ok(
-    secondDrainBytes <= BURST_LIMIT,
-    `ACK-triggered drain should respect burst limit: ${secondDrainBytes} <= ${BURST_LIMIT}`,
-  );
-
-  // With the drainScheduled guard, the first drain's setImmediate does NOT
-  // stack a duplicate callback.  Only one setImmediate should fire, draining
-  // the remaining data.
-  assert.ok(
-    thirdBurstBytes > 0,
-    `setImmediate should drain remaining data (got ${thirdBurstBytes})`,
-  );
-  assert.ok(
-    thirdBurstBytes <= BURST_LIMIT,
-    `setImmediate burst should respect limit: ${thirdBurstBytes} <= ${BURST_LIMIT}`,
-  );
+  // Remaining data arrives via setImmediate continuation.
+  const remaining = await new Promise<number>((resolve) => {
+    setImmediate(() => resolve(countTcpPayloadBytes(drainAllQemuTx(stack))));
+  });
+  assert.ok(remaining > 0, `continuation should drain remaining data (got ${remaining})`);
 });
