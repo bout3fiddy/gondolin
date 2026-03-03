@@ -166,6 +166,8 @@ type TcpSession = {
   allowRawTcp: boolean;
   pendingData: Buffer;
   httpMethod?: string;
+  /** true while a setImmediate continuation is pending for burst-limited drain */
+  drainScheduled: boolean;
 };
 
 export type NetworkStackOptions = {
@@ -753,6 +755,7 @@ export class NetworkStack extends EventEmitter {
         flowProtocol: null,
         allowRawTcp: false,
         pendingData: Buffer.alloc(0),
+        drainScheduled: false,
       };
       this.natTable.set(key, session);
 
@@ -1368,11 +1371,15 @@ export class NetworkStack extends EventEmitter {
       inFlight < maxInFlight &&
       bytesBurstThisTick >= this.TCP_MAX_BURST_BYTES
     ) {
-      setImmediate(() => {
-        if (this.natTable.get(key) === session) {
-          this.drainOutboundTcp(key, session);
-        }
-      });
+      if (!session.drainScheduled) {
+        session.drainScheduled = true;
+        setImmediate(() => {
+          session.drainScheduled = false;
+          if (this.natTable.get(key) === session) {
+            this.drainOutboundTcp(key, session);
+          }
+        });
+      }
       return; // Don't process endPending until the outbound buffer is fully drained
     }
 

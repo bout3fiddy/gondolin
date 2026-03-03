@@ -1496,3 +1496,154 @@ test("network-stack: high-priority TX evicts low-priority frames when capped", (
     "expected ARP reply to be present despite low-priority queue being full",
   );
 });
+
+/**
+ * Helper: count TCP payload bytes from raw QEMU TX output.
+ * Parses Ethernet → IPv4 → TCP, sums payload bytes (after TCP header).
+ */
+function countTcpPayloadBytes(txBuf: Buffer): number {
+  if (txBuf.length === 0) return 0;
+  const frames = decodeFramesFromQemuData(txBuf);
+  let total = 0;
+  for (const frame of frames) {
+    if (frame.length < 14) continue;
+    const etherType = frame.readUInt16BE(12);
+    if (etherType !== 0x0800) continue; // IPv4 only
+    const ipPayload = frame.subarray(14);
+    if (ipPayload.length < 20) continue;
+    const protocol = ipPayload[9];
+    if (protocol !== 6) continue; // TCP only
+    const ihl = (ipPayload[0] & 0x0f) * 4;
+    const ipTotalLen = ipPayload.readUInt16BE(2);
+    const tcpSegment = ipPayload.subarray(ihl, ipTotalLen);
+    if (tcpSegment.length < 20) continue;
+    const tcpDataOffset = (tcpSegment[12] >> 4) * 4;
+    const payloadLen = tcpSegment.length - tcpDataOffset;
+    if (payloadLen > 0) total += payloadLen;
+  }
+  return total;
+}
+
+test("network-stack: ACK during burst-limited drain bypasses per-tick pacing", async () => {
+  const gatewayMac = mac([0x5a, 0x94, 0xef, 0xe4, 0x0c, 0xdd]);
+  const vmMac = mac([0x02, 0x00, 0x00, 0x00, 0x00, 0x01]);
+
+  let key = "";
+
+  const stack = new NetworkStack({
+    gatewayMac,
+    vmMac,
+    dnsServers: ["8.8.8.8"],
+    callbacks: {
+      onUdpSend: () => {},
+      onTcpConnect: (m) => (key = m.key),
+      onTcpSend: () => {},
+      onTcpClose: () => {},
+      onTcpPause: () => {},
+      onTcpResume: () => {},
+    },
+  });
+
+  const srcIP = ip([192, 168, 127, 3]);
+  const dstIP = ip([93, 184, 216, 34]);
+  const BURST_LIMIT = 16 * 1024;
+
+  // Establish TCP connection.
+  stack.handleTCP(
+    buildTcpSegment({ srcPort: 50001, dstPort: 80, seq: 1, ack: 0, flags: 0x02 }),
+    srcIP,
+    dstIP,
+  );
+  stack.handleTcpConnected({ key });
+  drainAllQemuTx(stack); // drain SYN-ACK
+
+  // Guest ACKs the SYN-ACK so vmAck advances and data can flow.
+  const session0 = (stack as any).natTable.get(key);
+  stack.handleTCP(
+    buildTcpSegment({
+      srcPort: 50001,
+      dstPort: 80,
+      seq: 2,
+      ack: session0.mySeq,
+      flags: 0x10,
+    }),
+    srcIP,
+    dstIP,
+  );
+
+  // Queue 48KB of outbound data — enough for 3 bursts.
+  stack.handleTcpData({ key, data: Buffer.alloc(48 * 1024, 0x42) });
+
+  // Drain the TX queue (first burst: 16KB of TCP data).
+  const firstDrainTx = drainAllQemuTx(stack);
+  const firstDrainBytes = countTcpPayloadBytes(firstDrainTx);
+
+  // Now send an ACK for everything sent so far, which triggers
+  // a synchronous drainOutboundTcp BEFORE the setImmediate fires.
+  const session = (stack as any).natTable.get(key);
+  assert.ok(session, "session should still exist");
+
+  stack.handleTCP(
+    buildTcpSegment({
+      srcPort: 50001,
+      dstPort: 80,
+      seq: session.vmSeq,
+      ack: session.mySeq,
+      flags: 0x10, // ACK
+    }),
+    srcIP,
+    dstIP,
+  );
+
+  // Drain the TX queue again (second burst from ACK-triggered drain).
+  const secondDrainTx = drainAllQemuTx(stack);
+  const secondDrainBytes = countTcpPayloadBytes(secondDrainTx);
+
+  // Wait for setImmediate to fire and check how many bytes it sends.
+  // Without the drainScheduled guard, the ACK-triggered drain would have
+  // scheduled a second setImmediate, causing duplicate drain callbacks.
+  const thirdBurstBytes = await new Promise<number>((resolve) => {
+    setImmediate(() => {
+      const tx = drainAllQemuTx(stack);
+      resolve(countTcpPayloadBytes(tx));
+    });
+  });
+
+  // The setImmediate continuation should send additional bytes because
+  // it was scheduled before the ACK-triggered drain happened — this
+  // demonstrates the concurrent drain overlap.
+  //
+  // With a drainScheduled guard, thirdBurstBytes would be 0 because the
+  // ACK-triggered drain already drained the data that the setImmediate
+  // was going to process.
+  assert.ok(
+    firstDrainBytes > 0,
+    `first drain should send data (got ${firstDrainBytes})`,
+  );
+  assert.ok(
+    firstDrainBytes <= BURST_LIMIT,
+    `first drain should respect burst limit: ${firstDrainBytes} <= ${BURST_LIMIT}`,
+  );
+
+  // The ACK-triggered drain runs synchronously (sends another burst).
+  assert.ok(
+    secondDrainBytes > 0,
+    `ACK-triggered drain should send data (got ${secondDrainBytes})`,
+  );
+  assert.ok(
+    secondDrainBytes <= BURST_LIMIT,
+    `ACK-triggered drain should respect burst limit: ${secondDrainBytes} <= ${BURST_LIMIT}`,
+  );
+
+  // With the drainScheduled guard, the first drain's setImmediate does NOT
+  // stack a duplicate callback.  Only one setImmediate should fire, draining
+  // the remaining data.
+  assert.ok(
+    thirdBurstBytes > 0,
+    `setImmediate should drain remaining data (got ${thirdBurstBytes})`,
+  );
+  assert.ok(
+    thirdBurstBytes <= BURST_LIMIT,
+    `setImmediate burst should respect limit: ${thirdBurstBytes} <= ${BURST_LIMIT}`,
+  );
+});
